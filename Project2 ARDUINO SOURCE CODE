@@ -1,0 +1,199 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_HTS221.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SHT4x.h>
+#include <Adafruit_MPU6050.h>
+#include <time.h>
+#include <NTPClient.h>
+#include <freertos/queue.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <stdlib.h>
+
+// Wi-Fi credentials
+#define WIFI_SSID "CUHomeWiFi(2.4G)-1601"
+#define WIFI_PASSWORD "420463772"
+
+// MQTT Credentials for NETPIE
+const char* mqtt_server = "broker.netpie.io";
+const int mqtt_port = 1883;
+const char* mqtt_clientID = "3628f6e5-eddd-4907-bf3d-07f49819d24c";
+const char* mqtt_username = "eqLncTz2CpDfxtR3fGohKhZHxkpzCS36";
+const char* mqtt_password = "bLAvV7mtjDunGVaMxzXANqkXpCM4khPs";
+
+// Sensor objects
+Adafruit_HTS221 hts;
+Adafruit_SHT4x sht4;
+Adafruit_BMP280 bmp;
+Adafruit_MPU6050 mpu;
+
+// Wi-Fi and MQTT client
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Queue for sensor data
+struct SensorData {
+    float temperature;
+    float humidity;
+    float pressure;
+    float accelX, accelY, accelZ;
+    float gyroX, gyroY, gyroZ;
+};
+QueueHandle_t sensorDataQueue;
+
+// ✅ Function: เชื่อมต่อ WiFi
+void connectToWiFi() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int retry = 0;
+    while (WiFi.status() != WL_CONNECTED && retry < 10) {
+        delay(2000);
+        Serial.print(".");
+        retry++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n✅ Connected to WiFi.");
+    } else {
+        Serial.println("\n❌ WiFi Connection Failed! Restarting ESP32...");
+        ESP.restart();
+    }
+}
+
+// ✅ Function: เชื่อมต่อ NETPIE MQTT
+void connectToNETPIE() {
+    client.setServer(mqtt_server, mqtt_port);
+    int retry = 0;
+    while (!client.connected() && retry < 5) {
+        Serial.print("Attempting MQTT connection...");
+        if (client.connect(mqtt_clientID, mqtt_username, mqtt_password)) {
+            Serial.println("✅ Connected to NETPIE MQTT.");
+        } else {
+            Serial.print("❌ Failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" Retrying in 5 seconds...");
+            retry++;
+            delay(5000);
+        }
+    }
+    if (!client.connected()) {
+        Serial.println("🚨 MQTT Connection Failed! Restarting ESP32...");
+        ESP.restart();
+    }
+}
+
+// ✅ Task: อ่านค่าจากเซ็นเซอร์และเก็บลง Queue ทุก 10 วินาที
+void getData(void *pvParameters) {
+    SensorData data;
+    for (;;) {
+        sensors_event_t HTS221_humidity, HTS221_temp, bmp_temp, bmp_pressure;
+        sensors_event_t accel, gyro;
+        bool sensorFound = false;
+
+        // อ่านค่าจาก HTS221 หรือ SHT4x
+        if (hts.begin_I2C()) {
+            hts.getEvent(&HTS221_humidity, &HTS221_temp);
+            data.temperature = HTS221_temp.temperature;
+            data.humidity = HTS221_humidity.relative_humidity;
+            sensorFound = true;
+        } else if (sht4.begin()) {
+            sensors_event_t sht_humid, sht_temp;
+            sht4.getEvent(&sht_humid, &sht_temp);
+            data.temperature = sht_temp.temperature;
+            data.humidity = sht_humid.relative_humidity;
+            sensorFound = true;
+        }
+
+        // อ่านค่าความกดอากาศจาก BMP280
+        if (bmp.begin(0x76)) {
+            bmp.getTemperatureSensor()->getEvent(&bmp_temp);
+            bmp.getPressureSensor()->getEvent(&bmp_pressure);
+            data.pressure = bmp_pressure.pressure;
+            sensorFound = true;
+        }
+
+        // อ่านค่า Acceleration และ Gyroscope จาก MPU6050
+        if (mpu.begin()) {
+            mpu.getEvent(&accel, &gyro, &bmp_temp);
+            data.accelX = accel.acceleration.x;
+            data.accelY = accel.acceleration.y;
+            data.accelZ = accel.acceleration.z;
+            data.gyroX = gyro.gyro.x;
+            data.gyroY = gyro.gyro.y;
+            data.gyroZ = gyro.gyro.z;
+            sensorFound = true;
+        }
+
+        // ส่งข้อมูลเข้า Queue
+        if (sensorFound) {
+            xQueueSend(sensorDataQueue, &data, (TickType_t)10);
+            Serial.println("📦 Sensor Data Queued");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000));  // อ่านค่าทุก 10 วินาที
+    }
+}
+
+// ✅ Task: ส่งข้อมูลไปยัง NETPIE MQTT ทุก 10 วินาที
+void PublishData(void *pvParameters) {
+    SensorData data;
+    for (;;) {
+        if (xQueueReceive(sensorDataQueue, &data, portMAX_DELAY)) {
+            if (!client.connected()) {
+                connectToNETPIE();
+            }
+
+            // สร้าง JSON สำหรับส่งไปยัง Shadow
+            String jsonData = "{\"data\": {"
+                              "\"temperature\": " + String(data.temperature, 2) + 
+                              ", \"humidity\": " + String(data.humidity, 2) + 
+                              ", \"pressure\": " + String(data.pressure, 2) + 
+                              ", \"accelX\": " + String(data.accelX, 2) + 
+                              ", \"accelY\": " + String(data.accelY, 2) + "}}";
+
+            // ส่งค่าไปยัง NETPIE
+            if (client.publish("@shadow/data/update", jsonData.c_str(), true)) {
+                Serial.println("✅ Data sent to NETPIE Shadow: " + jsonData);
+            } else {
+                Serial.println("❌ Failed to send data to NETPIE Shadow!");
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(10000));  // ส่งทุก 10 วินาที
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(41, 40);
+
+    connectToWiFi();
+    connectToNETPIE();
+
+    Serial.println("🔍 Checking sensors...");
+
+    if (mpu.begin()) {
+        Serial.println("✅ MPU6050 detected.");
+    } else {
+        Serial.println("❌ MPU6050 not found.");
+    }
+
+    while (!bmp.begin(0x76)) {
+        Serial.println("⚠️ BMP280 not detected. Retrying...");
+        delay(2000);
+    }
+    Serial.println("✅ Found BMP280 sensor.");
+
+    // สร้าง Queue สำหรับเก็บ Sensor Data
+    sensorDataQueue = xQueueCreate(10, sizeof(SensorData));
+
+    // ✅ สร้าง Thread สำหรับอ่านค่าและส่งค่า
+    xTaskCreate(getData, "SensorTask", 10000, NULL, 1, NULL);
+    xTaskCreate(PublishData, "MqttTask", 10000, NULL, 1, NULL);
+}
+
+void loop() {
+    client.loop();
+}
