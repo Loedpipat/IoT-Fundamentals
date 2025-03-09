@@ -1,0 +1,70 @@
+#include <WiFi.h>
+#include "time.h"
+
+// Wi-Fi credentials
+const char* ssid = "XLเอง";     // Replace with your Wi-Fi SSID
+const char* password = "11111111"; // Replace with your Wi-Fi password
+
+// NTP Server and Time Zone (UTC+7 for Thailand)
+const long  gmtOffset_sec = 7 * 3600;  // UTC+7 (Thailand is 7 hours ahead of UTC)
+const int   daylightOffset_sec = 0;    // No daylight saving adjustment
+const char* ntpServer = "pool.ntp.org"; // Global NTP Server
+
+void setup() {
+    Serial.begin(115200); // Initialize Serial Monitor with Baud Rate 115200
+    
+    // Connect to Wi-Fi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.println("Connecting to Wi-Fi...");
+    }
+    Serial.println("Wi-Fi Connected");
+
+    // Set time using NTP
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    
+    // Create a task to display the real-time clock every second
+    xTaskCreate(Task_DisplayClock, "Display Clock", 4096, NULL, 1, NULL);
+
+    // Create a task to update time from NTP every 1 minute (higher priority)
+    xTaskCreate(Task_UpdateNTP, "Update NTP", 4096, NULL, 2, NULL);
+}
+
+// Task 1: Display real-time clock (RTC) on Serial Monitor every second
+void Task_DisplayClock(void * parameter) {
+    struct tm timeinfo;
+    for (;;) {  // Infinite loop
+        if (getLocalTime(&timeinfo)) {
+            Serial.printf("Time From RTC = %02d:%02d:%02d %02d/%02d/%04d\n",
+                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                          timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+        } else {
+            Serial.println("Failed to get time");
+        }
+        delay(1000); // Wait 1 second before repeating
+    }
+}
+
+// Task 2: Update time from NTP server every 1 minute
+void Task_UpdateNTP(void * parameter) {
+    for (;;) { // Infinite loop
+        Serial.println("Updating time from NTP...");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            Serial.printf("Update Time From NTP = %02d:%02d:%02d %02d/%02d/%04d\n",
+                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                          timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+        } else {
+            Serial.println("Failed to update time from NTP");
+        }
+        
+        delay(60000); // Wait 60 seconds before repeating (update every 1 minute)
+    }
+}
+
+void loop() {
+    // Empty loop since FreeRTOS tasks are handling everything
+}
